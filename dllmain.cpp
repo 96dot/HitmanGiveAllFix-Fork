@@ -12,6 +12,9 @@
 //    whose animation the level does not have stay empty. After they are set up, each empty slot is
 //    filled from the first set slot of a similar weapon type.
 // 3 and 4 are DustyRogue's (HitmanBloodMoney_Combined.ips), including the slot table.
+// 5. Inventory list: the inventory menu keeps its items in a sorted list of 192 entries inside
+//    the menu object, and a failed check closes the game when a 193rd item is added (opening the
+//    inventory in the Hideout after Give All). When the list is full, the item is left out instead.
 //
 // Supports the Steam, GOG and disc (retail patch, 4,366,336-byte exe) builds; on any other build,
 // or if any of the expected bytes differ, it changes nothing. Writes HitmanGiveAllFix.log next to
@@ -47,14 +50,15 @@ struct Build {
     uintptr_t lookupNotFound;  // pop edi; pop esi; pop ebp; xor eax,eax; pop ebx; add esp,0Ch; ret 8
     uintptr_t purgeLoop;       // jle past the resource release loop (after test ebx,ebx)
     uintptr_t slotsReady;      // mov edx,[esi]; mov ecx,esi; call [edx+648h]  (esi = actor)
+    uintptr_t inventoryAdd;    // kInventoryAddCode; 0 = search for it near 0x680000
 };
 
 const Build kBuilds[] = {
-    {"Steam", 0x447EF98A, 0x73CA80, 0x772FA8, 0x982920, 0x99AE68, 0x464EF9, 0x464F3D, 0x464F92, 0x45CB7F, 0x5F07E3},
-    {"GOG", 0x446B55B0, 0x7290F0, 0x75FF68, 0x96E8F0, 0x986E38, 0x465019, 0x46505D, 0x4650B2, 0x45CD1F, 0x5F0733},
+    {"Steam", 0x447EF98A, 0x73CA80, 0x772FA8, 0x982920, 0x99AE68, 0x464EF9, 0x464F3D, 0x464F92, 0x45CB7F, 0x5F07E3, 0x67FFA0},
+    {"GOG", 0x446B55B0, 0x7290F0, 0x75FF68, 0x96E8F0, 0x986E38, 0x465019, 0x46505D, 0x4650B2, 0x45CD1F, 0x5F0733, 0x67F4D0},
     // From DustyRogue's HitmanBloodMoney_GiveAllCrashFix_v2.ips and HitmanBloodMoney_Combined.ips,
-    // made for this exe.
-    {"disc", 0x4492B845, 0x73D3E0, 0x773FA8, 0x983F20, 0x99C468, 0x465059, 0x46509D, 0x4650F2, 0x45CD2F, 0x5F0F73},
+    // made for this exe. The inventory list's address is not known for it.
+    {"disc", 0x4492B845, 0x73D3E0, 0x773FA8, 0x983F20, 0x99C468, 0x465059, 0x46509D, 0x4650F2, 0x45CD2F, 0x5F0F73, 0},
 };
 
 constexpr uint32_t kOldPoolSize = 0x18000;    // 96 KB
@@ -67,6 +71,14 @@ const uint8_t kNotFoundCode[] = {0x5F, 0x5E, 0x5D, 0x33, 0xC0, 0x5B, 0x83, 0xC4,
 constexpr size_t kStolen = 6;  // bytes of kCheck1Code / kCheck2Code moved into the check stubs
 const uint8_t kPurgeCode[] = {0x7E, 0x18, 0x8B, 0xFB};
 const uint8_t kSlotsReadyCode[] = {0x8B, 0x16, 0x8B, 0xCE, 0xFF, 0x92, 0x48, 0x06, 0x00, 0x00};
+
+// Adding an item to the inventory menu's list (thiscall, ret 8; [ecx] = count):
+// push ecx; push ebp; mov ebp,ecx; cmp dword [ebp],0C0h; push esi; push edi; jne +1; int3
+const uint8_t kInventoryAddCode[] = {0x51, 0x55, 0x8B, 0xE9, 0x81, 0x7D, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x56, 0x57, 0x75, 0x01, 0xCC};
+constexpr size_t kInventoryFullCheck = 13;   // the jne +1; int3
+constexpr size_t kInventoryExit = 0xAF;      // pop esi; mov eax,edx; pop ebp; pop ecx; ret 8
+const uint8_t kInventoryExitCode[] = {0x5E, 0x8B, 0xC2, 0x5D, 0x59, 0xC2, 0x08, 0x00};
+constexpr size_t kInventoryPad = 12;         // int3 padding before the function, used for the full case
 
 // Animation slots: offsets in the actor, each with the group of slots it is filled from when
 // empty (first non-empty one wins, in this order). Slots filled earlier can feed later ones.
@@ -288,11 +300,54 @@ void PatchSlots(const Build& b) {
     }
 }
 
+// The build's inventory-list function, or 0. On a build without a known address, the one match of
+// its bytes near the Steam/GOG addresses.
+uintptr_t FindInventoryAdd(const Build& b) {
+    if (b.inventoryAdd) {
+        return Matches(b.inventoryAdd, kInventoryAddCode, sizeof(kInventoryAddCode)) ? b.inventoryAdd : 0;
+    }
+    uintptr_t found = 0;
+    for (uintptr_t a = 0x670000; a < 0x690000; ++a) {
+        if (Matches(a, kInventoryAddCode, sizeof(kInventoryAddCode))) {
+            if (found) {
+                return 0;
+            }
+            found = a;
+        }
+    }
+    return found;
+}
+
+// When the list is full: "jne +1; int3" becomes "je pad; nop", and the padding before the function
+// gets "pop edi; xor edx,edx; jmp exit", which returns without adding the item. (Callers ignore
+// the returned index.)
+void PatchInventory(const Build& b) {
+    uintptr_t f = FindInventoryAdd(b);
+    uint8_t pad[kInventoryPad];
+    memset(pad, 0xCC, sizeof(pad));
+    if (!f || !Matches(f - kInventoryPad, pad, sizeof(pad)) ||
+        !Matches(f + kInventoryExit, kInventoryExitCode, sizeof(kInventoryExitCode))) {
+        Log("inventory list: function not found, left as it is");
+        return;
+    }
+    uintptr_t full = f - kInventoryPad + 4;
+    uint8_t leave[8] = {0x5F, 0x33, 0xD2, 0xE9};
+    Put32(leave + 4, Rel32(full + 8, f + kInventoryExit));
+    uintptr_t check = f + kInventoryFullCheck;
+    const uint8_t branch[3] = {0x74, static_cast<uint8_t>(full - (check + 2)), 0x90};
+    if (Write(full, leave, sizeof(leave)) && Write(check, branch, sizeof(branch))) {
+        Log("inventory list: full list leaves items out (at %08X)", static_cast<unsigned>(f));
+    } else {
+        Log("inventory list: could not write (error %lu)", GetLastError());
+    }
+}
+
 void Apply() {
     PatchPool(*g_build);
     PatchLookup(*g_build);
     PatchPurge(*g_build);
     PatchSlots(*g_build);
+    PatchInventory(*g_build);
 }
 
 // --- GOG: wait for SecuROM to decrypt the code -------------------------------------------------
