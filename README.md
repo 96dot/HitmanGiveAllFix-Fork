@@ -24,8 +24,8 @@ This fork adds one more:
 
 ## Differences from the original
 
-- **No modified exe.** Everything is patched in memory at startup; the game files stay as they are, and the DRM stays intact.
-- **Steam, GOG and disc.** Each build has its own addresses (see below). The build is recognised by the exe's link time, and every byte is checked before anything is written; on an unknown build, or if anything differs, nothing is changed.
+- **No modified exe.** Everything is patched in memory at startup; the game files, including the exe, stay as they are.
+- **Steam, GOG and disc.** Each build has its own addresses (see below). The build is recognised by the exe's link time, and every byte is checked before anything is written. On an unknown build, or if any byte of fixes 1–4 differs, nothing is changed. The inventory-list fix is checked on its own and is only left out if its bytes differ.
 - **No code cave in the exe.** The pool fix only changes two operands of the allocator's set-up call (the buffer size and address), and the purge-loop fix one byte. The two lookup checks and the animation-slot hook live in small blocks of memory the DLL allocates; the slot filling itself is C++ in the DLL. The inventory-list fix changes three bytes and uses 8 bytes of the empty padding before that function, in memory.
 - **SecuROM (GOG).** The GOG exe is encrypted when the DLL loads. The DLL replaces `msvcr71!_initterm` (which only calls each function in a list) and applies the patches when the game's startup calls it to run its static initialisers: after decryption, before the item pool is set up.
 
@@ -34,9 +34,9 @@ This fork adds one more:
 Pick **one** of these:
 
 - **`dsound.dll`** (no ASI loader needed): copy it into the game folder, next to `HitmanBloodMoney.exe`. The game loads DirectSound from its folder; this DLL applies the fix and passes every DirectSound call on to Windows' own `dsound.dll`. It works alongside mods that use `dinput8.dll` or `d3d9.dll` (for example the [Reprisal features](https://github.com/96dot/HitmanReprisalPort) mod or nemesis2000's widescreen fix).
-- **`HitmanGiveAllFix.asi`**: for an ASI loader (Ultimate ASI Loader). If another mod already uses `dinput8.dll`, give the loader a different name that the game loads, such as `dsound.dll`.
+- **`HitmanGiveAllFix.asi`**: for an ASI loader (Ultimate ASI Loader). If another mod already uses `dinput8.dll`, rename the ASI loader (not this file) to another name the game loads, such as `dsound.dll`.
 
-The fix writes `HitmanGiveAllFix.log` next to the game. On Steam it should say:
+The fix writes `HitmanGiveAllFix.log` next to the game. On Steam it should say (the disc release logs `disc build`):
 
 ```
 HitmanGiveAllFix: Steam build
@@ -47,7 +47,9 @@ animation slots: fallback added
 inventory list: full list leaves items out (at 0067FFA0)
 ```
 
-To uninstall, delete the DLL (and the log).
+On GOG two lines come first: `waiting for the game code to be decrypted (...)` and `game code decrypted (...)`. Any line that says "could not", "not found", "nothing changed" or "left as it is" means that fix (or all of them) is not in place; `... not as expected (already patched?), nothing changed` usually means the exe was patched with the `.ips` or both the DLL and the ASI are installed.
+
+To uninstall, delete `dsound.dll` or `HitmanGiveAllFix.asi` (and the log).
 
 ### Cheats
 
@@ -61,7 +63,7 @@ The cheat menu opens with **C** during a mission once `EnableCheats 1` is in `Hi
 | GOG | `446B55B0` | `0x7290F0` | `0x465019`, `0x46505D` | `0x4650B2` | `0x45CD1F` | `0x5F0733` | `0x67F4D0` |
 | Disc 1.2 (4,366,336-byte exe) | `4492B845` | `0x73D3E0` | `0x465059`, `0x46509D` | `0x4650F2` | `0x45CD2F` | `0x5F0F73` | searched for |
 
-The disc addresses come from DustyRogue's `.ips` files, which were made for that exe. The inventory list's address is not known for it: the DLL searches `0x670000`–`0x690000` for the function's bytes and patches it only if they occur exactly once. Disc releases older than 1.2 are not supported yet. An exe that has already been patched with the `.ips` (or the original mod's exe) does not match, and the DLL leaves it alone.
+The disc addresses come from DustyRogue's `.ips` files, which were made for that exe. The inventory list's address is not known for it: the DLL searches `0x670000`–`0x690000` for the function's bytes and patches it only if they occur exactly once. Disc releases older than 1.2 are not supported yet; only the link time is checked, not the file size. An exe that has already been patched with the `.ips` (or the original mod's exe) does not match, and the DLL leaves it alone.
 
 ## Testing so far
 
@@ -75,7 +77,7 @@ On GOG, finishing the training mission with "Complete level" closes the game whe
 
 ## Building
 
-Needs Visual Studio with the C++ tools (x86). Run `build.cmd`; it writes `out\dsound.dll` and `out\HitmanGiveAllFix.asi`, both from the same `dllmain.cpp`. `dllmain.cpp` also drops into DustyRogue's original Visual Studio project in place of theirs (build Release / Win32, preferably with the static runtime, `/MT`).
+Needs Visual Studio with the C++ tools (x86). Run `build.cmd`; it writes `out\dsound.dll` (`dllmain.cpp` plus the DirectSound pass-through in `dsound_proxy.cpp`) and `out\HitmanGiveAllFix.asi` (`dllmain.cpp` alone). `dllmain.cpp` also drops into DustyRogue's original Visual Studio project in place of theirs (build Release / Win32, preferably with the static runtime, `/MT`).
 
 ## Credits
 

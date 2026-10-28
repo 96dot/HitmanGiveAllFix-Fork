@@ -1,6 +1,6 @@
-// Lets the fix load as dsound.dll from the game folder (the game imports DirectSound on both
-// builds), next to a mod that already uses dinput8.dll. Every export jumps to the same function
-// in the system's dsound.dll, loaded on the first call.
+// Lets the fix load as dsound.dll from the game folder (the game imports DirectSound), next to a
+// mod that already uses dinput8.dll. Every export jumps to the function of the same name in the
+// system's dsound.dll, loaded on the first call.
 
 #include <windows.h>
 
@@ -10,16 +10,18 @@ HMODULE g_dsound = nullptr;
 
 extern "C" FARPROC __cdecl Resolve(const char* name) {
     if (!g_dsound) {
+        const char kFile[] = "\\dsound.dll";
         char path[MAX_PATH];
         UINT n = GetSystemDirectoryA(path, MAX_PATH);
-        if (n && n < MAX_PATH - 12) {
-            lstrcatA(path, "\\dsound.dll");
+        if (n && n + sizeof(kFile) <= MAX_PATH) {
+            lstrcatA(path, kFile);
             g_dsound = LoadLibraryA(path);
         }
     }
     FARPROC fn = g_dsound ? GetProcAddress(g_dsound, name) : nullptr;
     if (!fn) {
-        FatalAppExitA(0, "dsound.dll (HitmanGiveAllFix): the system's dsound.dll could not be loaded.");
+        FatalAppExitA(0, "dsound.dll (HitmanGiveAllFix): the system's dsound.dll could not be loaded, "
+                         "or it lacks a function the game asked for.");
     }
     return fn;
 }

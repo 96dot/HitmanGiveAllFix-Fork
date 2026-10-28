@@ -16,9 +16,9 @@
 //    the menu object, and a failed check closes the game when a 193rd item is added (opening the
 //    inventory in the Hideout after Give All). When the list is full, the item is left out instead.
 //
-// Supports the Steam, GOG and disc (retail patch, 4,366,336-byte exe) builds; on any other build,
-// or if any of the expected bytes differ, it changes nothing. Writes HitmanGiveAllFix.log next to
-// the game.
+// Supports the Steam, GOG and disc (retail patch, 4,366,336-byte exe) builds. On any other build,
+// or if any of the expected bytes for fixes 1-4 differ, it changes nothing. Fix 5 is checked on its
+// own and only left out when its bytes differ. Writes HitmanGiveAllFix.log next to the game.
 //
 // Timing: the allocator patch has to land before the game's static initialisers run.
 // - Steam: the exe is packed; the unpacker loads the game's DLLs (and ASI loaders) after
@@ -50,16 +50,24 @@ struct Build {
     uintptr_t lookupNotFound;  // pop edi; pop esi; pop ebp; xor eax,eax; pop ebx; add esp,0Ch; ret 8
     uintptr_t purgeLoop;       // jle past the resource release loop (after test ebx,ebx)
     uintptr_t slotsReady;      // mov edx,[esi]; mov ecx,esi; call [edx+648h]  (esi = actor)
-    uintptr_t inventoryAdd;    // kInventoryAddCode; 0 = search for it near 0x680000
+    uintptr_t inventoryAdd;    // kInventoryAddCode; 0 = search kInventorySearchStart..End for it
+    bool encrypted;            // the code is still encrypted when DllMain runs (SecuROM)
 };
 
 const Build kBuilds[] = {
-    {"Steam", 0x447EF98A, 0x73CA80, 0x772FA8, 0x982920, 0x99AE68, 0x464EF9, 0x464F3D, 0x464F92, 0x45CB7F, 0x5F07E3, 0x67FFA0},
-    {"GOG", 0x446B55B0, 0x7290F0, 0x75FF68, 0x96E8F0, 0x986E38, 0x465019, 0x46505D, 0x4650B2, 0x45CD1F, 0x5F0733, 0x67F4D0},
+    {"Steam", 0x447EF98A, 0x73CA80, 0x772FA8, 0x982920, 0x99AE68, 0x464EF9, 0x464F3D, 0x464F92, 0x45CB7F, 0x5F07E3, 0x67FFA0, false},
+    {"GOG", 0x446B55B0, 0x7290F0, 0x75FF68, 0x96E8F0, 0x986E38, 0x465019, 0x46505D, 0x4650B2, 0x45CD1F, 0x5F0733, 0x67F4D0, true},
     // From DustyRogue's HitmanBloodMoney_GiveAllCrashFix_v2.ips and HitmanBloodMoney_Combined.ips,
     // made for this exe. The inventory list's address is not known for it.
-    {"disc", 0x4492B845, 0x73D3E0, 0x773FA8, 0x983F20, 0x99C468, 0x465059, 0x46509D, 0x4650F2, 0x45CD2F, 0x5F0F73, 0},
+    {"disc", 0x4492B845, 0x73D3E0, 0x773FA8, 0x983F20, 0x99C468, 0x465059, 0x46509D, 0x4650F2, 0x45CD2F, 0x5F0F73, 0, false},
 };
+
+// ZItem::s_ItemMemoryAllocator: its pool name, and the dwords holding its buffer and size (both
+// zero until its initialiser has run).
+const char kPoolName[] = "ZItem::s_ItemMemoryAllocator";
+constexpr size_t kAllocatorBuffer = 3;
+constexpr size_t kAllocatorSize = 4;
+constexpr size_t kPoolInitSize = 22;   // the initialiser's pushes and mov ecx (see PoolInitCode)
 
 constexpr uint32_t kOldPoolSize = 0x18000;    // 96 KB
 constexpr uint32_t kNewPoolSize = 0x400000;   // 4 MB
@@ -79,6 +87,9 @@ constexpr size_t kInventoryFullCheck = 13;   // the jne +1; int3
 constexpr size_t kInventoryExit = 0xAF;      // pop esi; mov eax,edx; pop ebp; pop ecx; ret 8
 const uint8_t kInventoryExitCode[] = {0x5E, 0x8B, 0xC2, 0x5D, 0x59, 0xC2, 0x08, 0x00};
 constexpr size_t kInventoryPad = 12;         // int3 padding before the function, used for the full case
+constexpr size_t kInventoryLeaveSize = 8;    // the full-case code written at the end of the padding
+constexpr uintptr_t kInventorySearchStart = 0x670000;   // around the Steam and GOG addresses
+constexpr uintptr_t kInventorySearchEnd = 0x690000;
 
 // Animation slots: offsets in the actor, each with the group of slots it is filled from when
 // empty (first non-empty one wins, in this order). Slots filled earlier can feed later ones.
@@ -137,15 +148,17 @@ void Log(const char* format, ...) {
     fclose(f);
 }
 
+// True if [address, address + n) is readable memory.
+bool Readable(uintptr_t address, size_t n) {
+    MEMORY_BASIC_INFORMATION mbi;
+    return VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+           !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+           address + n <= reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+}
+
 // True if [address, address + n) is readable memory holding these bytes.
 bool Matches(uintptr_t address, const void* bytes, size_t n) {
-    MEMORY_BASIC_INFORMATION mbi;
-    if (!VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
-        (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
-        address + n > reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize) {
-        return false;
-    }
-    return memcmp(reinterpret_cast<const void*>(address), bytes, n) == 0;
+    return Readable(address, n) && memcmp(reinterpret_cast<const void*>(address), bytes, n) == 0;
 }
 
 bool Write(uintptr_t address, const void* bytes, size_t n) {
@@ -163,7 +176,7 @@ void Put32(uint8_t* p, uint32_t v) { memcpy(p, &v, 4); }
 uint32_t Rel32(uintptr_t from, uintptr_t to) { return static_cast<uint32_t>(to - from); }
 
 // The allocator's static initialiser as the build has it.
-void PoolInitCode(const Build& b, uint8_t (&code)[22]) {
+void PoolInitCode(const Build& b, uint8_t (&code)[kPoolInitSize]) {
     uint8_t* p = code;
     *p++ = 0x6A; *p++ = 0x00;                      // push 0
     *p++ = 0x68; Put32(p, b.poolName); p += 4;      // push name
@@ -172,13 +185,14 @@ void PoolInitCode(const Build& b, uint8_t (&code)[22]) {
     *p++ = 0xB9; Put32(p, b.allocator);             // mov ecx, allocator
 }
 
-// The first piece of the code this fix changes that is not as expected, or null if all of it is
-// there (the game is the expected build, unpacked / decrypted, and not patched already).
+// The first piece of the code fixes 1-4 change that is not as expected, or null if all of it is
+// there (the game is the expected build, unpacked / decrypted, and not patched already). Fix 5 is
+// checked separately, in PatchInventory.
 const char* Mismatch(const Build& b) {
-    uint8_t poolInit[22];
+    uint8_t poolInit[kPoolInitSize];
     PoolInitCode(b, poolInit);
     if (!Matches(b.poolInit, poolInit, sizeof(poolInit))) return "item pool initialiser";
-    if (!Matches(b.poolName, "ZItem::s_ItemMemoryAllocator", 29)) return "item pool name";
+    if (!Matches(b.poolName, kPoolName, sizeof(kPoolName))) return "item pool name";
     if (!Matches(b.lookupCheck1, kCheck1Code, sizeof(kCheck1Code))) return "lookup check 1";
     if (!Matches(b.lookupCheck2, kCheck2Code, sizeof(kCheck2Code))) return "lookup check 2";
     if (!Matches(b.lookupNotFound, kNotFoundCode, sizeof(kNotFoundCode))) return "lookup exit";
@@ -192,8 +206,9 @@ bool CodeReady(const Build& b) { return !Mismatch(b); }
 void PatchPool(const Build& b) {
     // The allocator stays zero until its initialiser has run; after that it is too late.
     const uint32_t* allocator = reinterpret_cast<const uint32_t*>(b.allocator);
-    if (allocator[3] || allocator[4]) {
-        Log("item pool: already set up (buffer %08X, %u bytes), left at 96 KB", allocator[3], allocator[4]);
+    if (allocator[kAllocatorBuffer] || allocator[kAllocatorSize]) {
+        Log("item pool: already set up (buffer %08X, %u bytes), left as it is", allocator[kAllocatorBuffer],
+            allocator[kAllocatorSize]);
         return;
     }
     void* pool = VirtualAlloc(nullptr, kNewPoolSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -202,7 +217,8 @@ void PatchPool(const Build& b) {
         return;
     }
     uint32_t buffer = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pool));
-    if (Write(b.poolInit + 8, &kNewPoolSize, 4) && Write(b.poolInit + 13, &buffer, 4)) {
+    // The buffer goes in first: a 4 MB size on the old 96 KB buffer would overrun it.
+    if (Write(b.poolInit + 13, &buffer, 4) && Write(b.poolInit + 8, &kNewPoolSize, 4)) {
         Log("item pool: %u KB at %08X instead of 96 KB at %08X", kNewPoolSize / 1024, buffer, b.poolBuffer);
     } else {
         Log("item pool: could not write the initialiser (error %lu)", GetLastError());
@@ -236,7 +252,10 @@ void PatchLookup(const Build& b) {
     BuildOffsetCheck(stubs, b.lookupCheck1, b.lookupNotFound);
     BuildOffsetCheck(stubs + 32, b.lookupCheck2, b.lookupNotFound);
     DWORD old;
-    VirtualProtect(stubs, 64, PAGE_EXECUTE_READ, &old);
+    if (!VirtualProtect(stubs, 64, PAGE_EXECUTE_READ, &old)) {
+        Log("lookup checks: could not make the checks executable (error %lu), not added", GetLastError());
+        return;
+    }
     FlushInstructionCache(GetCurrentProcess(), stubs, 64);
     if (JumpTo(b.lookupCheck1, stubs) && JumpTo(b.lookupCheck2, stubs + 32)) {
         Log("lookup checks: added");
@@ -289,7 +308,10 @@ void PatchSlots(const Build& b) {
     memcpy(p, kSlotsReadyCode, sizeof(kSlotsReadyCode)); p += sizeof(kSlotsReadyCode);
     *p++ = 0xE9; Put32(p, Rel32(s + 24, b.slotsReady + sizeof(kSlotsReadyCode)));         // jmp back
     DWORD old;
-    VirtualProtect(stub, 32, PAGE_EXECUTE_READ, &old);
+    if (!VirtualProtect(stub, 32, PAGE_EXECUTE_READ, &old)) {
+        Log("animation slots: could not make the hook executable (error %lu), not added", GetLastError());
+        return;
+    }
     FlushInstructionCache(GetCurrentProcess(), stub, 32);
     uint8_t jump[sizeof(kSlotsReadyCode)] = {0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90, 0x90};
     Put32(jump + 1, Rel32(b.slotsReady + 5, s));
@@ -301,14 +323,17 @@ void PatchSlots(const Build& b) {
 }
 
 // The build's inventory-list function, or 0. On a build without a known address, the one match of
-// its bytes near the Steam/GOG addresses.
+// its bytes in kInventorySearchStart..End.
 uintptr_t FindInventoryAdd(const Build& b) {
     if (b.inventoryAdd) {
         return Matches(b.inventoryAdd, kInventoryAddCode, sizeof(kInventoryAddCode)) ? b.inventoryAdd : 0;
     }
+    if (!Readable(kInventorySearchStart, kInventorySearchEnd - kInventorySearchStart + sizeof(kInventoryAddCode))) {
+        return 0;
+    }
     uintptr_t found = 0;
-    for (uintptr_t a = 0x670000; a < 0x690000; ++a) {
-        if (Matches(a, kInventoryAddCode, sizeof(kInventoryAddCode))) {
+    for (uintptr_t a = kInventorySearchStart; a < kInventorySearchEnd; ++a) {
+        if (memcmp(reinterpret_cast<const void*>(a), kInventoryAddCode, sizeof(kInventoryAddCode)) == 0) {
             if (found) {
                 return 0;
             }
@@ -330,9 +355,9 @@ void PatchInventory(const Build& b) {
         Log("inventory list: function not found, left as it is");
         return;
     }
-    uintptr_t full = f - kInventoryPad + 4;
-    uint8_t leave[8] = {0x5F, 0x33, 0xD2, 0xE9};
-    Put32(leave + 4, Rel32(full + 8, f + kInventoryExit));
+    uintptr_t full = f - kInventoryLeaveSize;
+    uint8_t leave[kInventoryLeaveSize] = {0x5F, 0x33, 0xD2, 0xE9};   // pop edi; xor edx,edx; jmp exit
+    Put32(leave + 4, Rel32(full + kInventoryLeaveSize, f + kInventoryExit));
     uintptr_t check = f + kInventoryFullCheck;
     const uint8_t branch[3] = {0x74, static_cast<uint8_t>(full - (check + 2)), 0x90};
     if (Write(full, leave, sizeof(leave)) && Write(check, branch, sizeof(branch))) {
@@ -354,9 +379,9 @@ void Apply() {
 // The game's CRT startup runs its static initialisers through msvcr71!_initterm, after SecuROM
 // has decrypted the code. (The first GetCommandLineA call after decryption comes too late: the
 // initialisers have run by then.) _initterm only calls each function pointer in a range, so it is
-// replaced outright by a jump to a copy that applies the patches first, on the first call made
-// once the code is decrypted; then the original bytes go back. DLLs call _initterm during their
-// own startup too, earlier; those calls just run their initialisers.
+// replaced outright by a jump to InittermHook, which does the same loop and applies the patches
+// first, on the first call made once the code is decrypted; then the original bytes go back. DLLs
+// call _initterm during their own startup too, earlier; those calls just run their initialisers.
 
 using Initialiser = void(__cdecl*)();
 uint8_t* g_initterm = nullptr;
@@ -365,7 +390,8 @@ volatile LONG g_applied = 0;
 
 void __cdecl InittermHook(Initialiser* begin, Initialiser* end) {
     if (!g_applied && CodeReady(*g_build) && InterlockedExchange(&g_applied, 1) == 0) {
-        Log("game code decrypted (_initterm from %08X)", reinterpret_cast<uintptr_t>(_ReturnAddress()));
+        Log("game code decrypted (_initterm from %08X)",
+            static_cast<unsigned>(reinterpret_cast<uintptr_t>(_ReturnAddress())));
         Apply();
         Write(reinterpret_cast<uintptr_t>(g_initterm), g_inittermBytes, sizeof(g_inittermBytes));
     }
@@ -390,12 +416,17 @@ bool HookInitterm() {
 
 void Start() {
     char path[MAX_PATH];
-    if (GetModuleFileNameA(nullptr, path, MAX_PATH)) {
+    DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
+    if (n && n < MAX_PATH) {
         char* slash = strrchr(path, '\\');
         if (slash) {
             slash[1] = '\0';
-            sprintf_s(g_logPath, "%sHitmanGiveAllFix.log", path);
-            DeleteFileA(g_logPath);
+            // A path too long for the log name leaves g_logPath empty: no log, nothing else changes.
+            if (_snprintf_s(g_logPath, _TRUNCATE, "%sHitmanGiveAllFix.log", path) < 0) {
+                g_logPath[0] = '\0';
+            } else {
+                DeleteFileA(g_logPath);
+            }
         }
     }
     auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(GetModuleHandleA(nullptr));
@@ -414,9 +445,11 @@ void Start() {
     if (CodeReady(*g_build)) {
         g_applied = 1;
         Apply();
+    } else if (!g_build->encrypted) {
+        // The code is there but different: the exe has been patched already (e.g. with the .ips),
+        // or another copy of this fix has applied it.
+        Log("%s not as expected (already patched?), nothing changed", Mismatch(*g_build));
     } else if (HookInitterm()) {
-        // Normal on GOG. On another build it stays this way if the exe has been patched already
-        // (e.g. with the .ips); nothing is changed then.
         Log("waiting for the game code to be decrypted (%s not as expected yet)", Mismatch(*g_build));
     } else {
         Log("could not hook msvcr71!_initterm, nothing changed");

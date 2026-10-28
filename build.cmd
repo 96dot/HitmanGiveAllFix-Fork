@@ -1,6 +1,7 @@
 @echo off
 rem Builds the fix (32-bit, static CRT) into out\: dsound.dll (loads on its own) and
-rem HitmanGiveAllFix.asi (for an ASI loader). Both come from the same dllmain.cpp.
+rem HitmanGiveAllFix.asi (for an ASI loader). Both come from the same dllmain.cpp; dsound.dll
+rem adds the DirectSound pass-through in dsound_proxy.cpp.
 setlocal
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -property installationPath`) do set "VSDIR=%%i"
